@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 import datetime
 import os
 import collections
@@ -50,6 +51,23 @@ class trainer(object):
         # Parámetros adicionales
         self.use_morph_loss = getattr(args, 'use_morph_loss', False)  # Si usar morphology loss
         self.morph_loss_weight = getattr(args, 'morph_loss_weight', 0.1)  # Peso para morphology loss
+        
+        # Configuración de optimización GPU
+        self.use_mixed_precision = self.hparams.get('use_mixed_precision', True)
+        self.use_compile = self.hparams.get('use_compile', True)
+        
+        # Optimizar configuración de GPU
+        if torch.cuda.is_available():
+            # Habilitar cuDNN benchmark (optimiza kernels para tamaños fijos)
+            torch.backends.cudnn.benchmark = True
+            # Permitir optimizaciones no determinísticas para velocidad
+            # (desactivar si necesitas reproducibilidad exacta)
+            torch.backends.cudnn.deterministic = False
+            # Habilitar TF32 para Ampere+ (RTX 30/40 series, A100, etc.) - acelera FP32
+            if hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends.cudnn, 'allow_tf32'):
+                torch.backends.cudnn.allow_tf32 = True
 
     def get_configs(self):
         dataset_class = get_dataset_class(self.dataset)
@@ -96,29 +114,70 @@ class trainer(object):
         model = TF_MorphoTransNet(configs=self.dataset_configs, hparams=self.hparams)
         model.to(self.device)
         
+        # Optimizar formato de memoria (channels_last puede ser más rápido para algunas operaciones)
+        # model = model.to(memory_format=torch.channels_last)  # Opcional, probar si mejora
+        
+        # Compilar modelo para optimización (PyTorch 2.0+)
+        if self.use_compile and hasattr(torch, 'compile'):
+            try:
+                self.logger.debug("Compilando modelo con torch.compile...")
+                model = torch.compile(model, mode='reduce-overhead')  # o 'max-autotune' para máxima optimización
+                self.logger.debug("Modelo compilado exitosamente")
+            except Exception as e:
+                self.logger.debug(f"No se pudo compilar el modelo: {e}")
+        
         # Contar parámetros
         num_params = count_parameters(model)
         self.logger.debug(f"Número de parámetros del modelo: {num_params:,}")
+        
+        # Información de GPU
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            self.logger.debug(f"GPU: {gpu_name}")
+            self.logger.debug(f"VRAM total: {gpu_memory:.2f} GB")
+            self.logger.debug(f"Mixed precision: {self.use_mixed_precision}")
+            self.logger.debug(f"Batch size: {self.hparams['batch_size']}")
+            self.logger.debug(f"Num workers: {self.hparams.get('num_workers', 0)}")
 
         # Average meters
         loss_avg_meters = collections.defaultdict(lambda: AverageMeter())
 
-        # Optimizador
-        self.optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=self.hparams["learning_rate"],
-            weight_decay=self.hparams["weight_decay"],
-            betas=(0.9, 0.99)
-        )
+        # Optimizador (AdamW puede ser más estable que Adam)
+        # Fused solo disponible en PyTorch 1.13+ y requiere CUDA
+        optimizer_kwargs = {
+            'lr': self.hparams["learning_rate"],
+            'weight_decay': self.hparams["weight_decay"],
+            'betas': (0.9, 0.999),
+            'eps': 1e-8
+        }
+        # Agregar fused si está disponible (PyTorch 1.13+)
+        if torch.cuda.is_available():
+            try:
+                # Probar si fused está disponible
+                test_optim = torch.optim.AdamW([torch.randn(1, requires_grad=True).cuda()], fused=True)
+                optimizer_kwargs['fused'] = True
+                del test_optim
+                torch.cuda.empty_cache()
+            except (TypeError, AttributeError):
+                # fused no está disponible, usar optimizador normal
+                pass
+        
+        self.optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+        
+        # Mixed precision scaler
+        self.scaler = GradScaler() if self.use_mixed_precision else None
         
         # Calcular pesos de clases para manejo de desbalance
         class_weights = get_class_weight(self.cw_dict)
-        weights = [class_weights.get(i, 1.0) for i in range(len(self.cw_dict))]
-        weights_array = np.array(weights).astype(np.float32)
-        weights_tensor = torch.tensor(weights_array).to(self.device)
+        weights = [float(class_weights.get(i, 1.0)) for i in range(len(self.cw_dict))]  # Asegurar que sean float nativos
+        weights_array = np.array(weights, dtype=np.float32)
+        weights_tensor = torch.tensor(weights_array, dtype=torch.float32).to(self.device)
         self.cross_entropy = torch.nn.CrossEntropyLoss(weight=weights_tensor)
         
-        self.logger.debug(f"Pesos de clases: {dict(zip(range(len(weights)), weights))}")
+        # Convertir a dict simple para logging
+        weights_dict = {i: float(w) for i, w in enumerate(weights)}
+        self.logger.debug(f"Pesos de clases: {weights_dict}")
 
         best_acc = 0
         best_f1 = 0
@@ -133,38 +192,49 @@ class trainer(object):
 
                 data = batches['samples'].float()
                 labels = batches['labels'].long()
-
-                # Forward pass
-                self.optimizer.zero_grad()
-
-                # El modelo retorna (logits, morph_loss)
-                if self.use_morph_loss:
-                    logits, morph_loss = model(data, use_attn=True, compute_morph_loss=True)
-                else:
-                    logits, morph_loss = model(data, use_attn=False, compute_morph_loss=False)
-
-                # Pérdida de clasificación
-                cls_loss = self.cross_entropy(logits, labels)
-
-                # Pérdida total
-                if self.use_morph_loss and morph_loss is not None:
-                    total_loss = cls_loss + self.morph_loss_weight * morph_loss
-                    loss_avg_meters['Morph_loss'].update(morph_loss.item(), self.hparams["batch_size"])
-                else:
-                    total_loss = cls_loss
-                    morph_loss = None
-
-                # Backward pass
-                total_loss.backward()
                 
-                # Gradient clipping para estabilidad
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                self.optimizer.step()
+                # Optimizar formato de memoria si está disponible
+                # data = data.contiguous(memory_format=torch.channels_last)
+
+                # Forward pass con mixed precision
+                self.optimizer.zero_grad(set_to_none=True)  # Más eficiente que zero_grad()
+
+                # Usar autocast para mixed precision
+                with autocast(enabled=self.use_mixed_precision):
+                    # El modelo retorna (logits, morph_loss)
+                    if self.use_morph_loss:
+                        logits, morph_loss = model(data, use_attn=True, compute_morph_loss=True)
+                    else:
+                        logits, morph_loss = model(data, use_attn=False, compute_morph_loss=False)
+
+                    # Pérdida de clasificación
+                    cls_loss = self.cross_entropy(logits, labels)
+
+                    # Pérdida total
+                    if self.use_morph_loss and morph_loss is not None:
+                        total_loss = cls_loss + self.morph_loss_weight * morph_loss
+                        loss_avg_meters['Morph_loss'].update(morph_loss.item(), data.size(0))
+                    else:
+                        total_loss = cls_loss
+                        morph_loss = None
+
+                # Backward pass con mixed precision
+                if self.use_mixed_precision:
+                    self.scaler.scale(total_loss).backward()
+                    # Gradient clipping
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    total_loss.backward()
+                    # Gradient clipping para estabilidad
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
 
                 # Actualizar métricas
-                loss_avg_meters['Total_loss'].update(total_loss.item(), self.hparams["batch_size"])
-                loss_avg_meters['Cls_loss'].update(cls_loss.item(), self.hparams["batch_size"])
+                loss_avg_meters['Total_loss'].update(total_loss.item(), data.size(0))
+                loss_avg_meters['Cls_loss'].update(cls_loss.item(), data.size(0))
 
             # Logging de pérdidas
             self.logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
@@ -226,20 +296,22 @@ class trainer(object):
         self.pred_labels = np.array([])
         self.true_labels = np.array([])
 
+        model.eval()
         with torch.no_grad():
             for batches in dataset:
                 batches = to_device(batches, self.device)
                 data = batches['samples'].float()
                 labels = batches['labels'].long()
 
-                # Forward pass
-                logits, morph_loss = model(data, use_attn=use_morph_loss, compute_morph_loss=use_morph_loss)
+                # Forward pass con mixed precision en evaluación también
+                with autocast(enabled=self.use_mixed_precision):
+                    logits, morph_loss = model(data, use_attn=use_morph_loss, compute_morph_loss=use_morph_loss)
 
-                # Calcular pérdida
-                loss = self.cross_entropy(logits, labels)
-                if use_morph_loss and morph_loss is not None:
-                    loss = loss + self.morph_loss_weight * morph_loss
-                total_loss_.append(loss.item())
+                    # Calcular pérdida
+                    loss = self.cross_entropy(logits, labels)
+                    if use_morph_loss and morph_loss is not None:
+                        loss = loss + self.morph_loss_weight * morph_loss
+                    total_loss_.append(loss.item())
                 
                 # Obtener predicciones
                 pred = logits.detach().argmax(dim=1)

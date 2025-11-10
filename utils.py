@@ -178,10 +178,13 @@ def get_class_weight(labels_dict):
         return {}
     
     max_num = max(labels_dict.values())
-    mu = 1.0 / (total / max_num)
+    mu = 1.0 / (total / max_num) if max_num > 0 else 1.0
     class_weight = dict()
     for key, value in labels_dict.items():
-        score = np.log(mu * total / float(value)) if value > 0 else 0.0
-        class_weight[key] = score if score > 1.0 else 1.0
+        if value > 0:
+            score = np.log(mu * total / float(value))
+            class_weight[key] = float(score) if score > 1.0 else 1.0
+        else:
+            class_weight[key] = 1.0
     return class_weight
 

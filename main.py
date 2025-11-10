@@ -140,6 +140,8 @@ class TF_MorphoTransNet(nn.Module):
         self.stft_n_fft = 256
         self.stft_hop_length = 16
         self.stft_win_length = 256
+        # Registrar ventana para STFT (evita warning y mejora calidad espectral)
+        self.register_buffer('stft_window', torch.hann_window(self.stft_win_length))
 
         # TF-MG-MSC: 2D Convs for morphology-guided multi-scale (reduced channels for lightweight)
         filter_sizes = [(3, 3), (5, 5), (7, 7)]  # Narrow for QRS (high-freq), medium for P/T, wide for rhythm
@@ -223,9 +225,12 @@ class TF_MorphoTransNet(nn.Module):
             x_stft = x.squeeze(1)
         
         # STFT: compatible con diferentes versiones de PyTorch
+        # register_buffer automáticamente mueve la ventana al dispositivo correcto
+        # Usar ventana Hann para mejor calidad espectral y evitar warning
         stft_complex = torch.stft(x_stft, n_fft=self.stft_n_fft, hop_length=self.stft_hop_length,
-                                  win_length=self.stft_win_length, return_complex=True,
-                                  normalized=False, onesided=True, pad_mode='reflect')
+                                  win_length=self.stft_win_length, window=self.stft_window,
+                                  return_complex=True, normalized=False, onesided=True, 
+                                  pad_mode='reflect')
         # Convertir a magnitud
         spec = torch.abs(stft_complex).unsqueeze(1)  # b, 1, f, t (magnitude spectrogram)
 

@@ -95,31 +95,47 @@ def data_generator(data_path, data_type, hparams):
     for i in range(len(np.unique(train_dataset.y_data.numpy()))):
         cw_dict[i] = cw.count(i)
 
-    # Crear dataloaders
-    batch_size = hparams["batch_size"]
+    # Crear dataloaders con configuración optimizada
+    batch_size = hparams.get("batch_size", 512)
+    num_workers = hparams.get("num_workers", 8)
+    pin_memory = hparams.get("pin_memory", True) if torch.cuda.is_available() else False
+    prefetch_factor = hparams.get("prefetch_factor", 4) if num_workers > 0 else None
+    
+    # Ajustar num_workers según disponibilidad
+    if num_workers > 0:
+        import multiprocessing
+        max_workers = multiprocessing.cpu_count()
+        num_workers = min(num_workers, max_workers)
+    
     train_loader = torch.utils.data.DataLoader(
         dataset=train_dataset, 
         batch_size=batch_size,
         shuffle=True, 
         drop_last=True, 
-        num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True if num_workers > 0 else False
     )
     val_loader = torch.utils.data.DataLoader(
         dataset=val_dataset, 
         batch_size=batch_size,
         shuffle=False, 
-        drop_last=True, 
-        num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
+        drop_last=True,  # Mantener consistente con train para mejor uso de GPU
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True if num_workers > 0 else False
     )
     test_loader = torch.utils.data.DataLoader(
         dataset=test_dataset, 
         batch_size=batch_size,
         shuffle=False, 
         drop_last=False, 
-        num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     return train_loader, val_loader, test_loader, cw_dict

@@ -1,19 +1,19 @@
 # Dependencias para TF_MorphoTransNet
 # PyTorch y dependencias principales
-#torch
+#torch>=2.0.0  # Necesario para torch.compile y optimizaciones
 #torchaudio>=0.9.0  # Para funciones de procesamiento de señales si se necesitan
 
 # Manipulación de tensores y operaciones avanzadas
-einops  # Para rearrange, repeat, etc.
+einops>=0.4.0  # Para rearrange, repeat, etc.
 
 # Procesamiento de señales y datos ECG
-numpy
-scipy  # Para filtros, interpolación, detección de picos
-pandas  # Para manejo de metadata de datasets
-wfdb  # Para leer archivos MIT-BIH y PTB-XL (WFDB format)
+numpy>=1.21.0
+scipy>=1.7.0  # Para filtros, interpolación, detección de picos
+pandas>=1.3.0  # Para manejo de metadata de datasets
+wfdb>=4.1.0  # Para leer archivos MIT-BIH y PTB-XL (WFDB format)
 
 # Utilidades adicionales (si se usan para entrenamiento/evaluación)
-scikit-learn  # Para métricas, escalado y evaluación
-matplotlib  # Para visualizaciones (opcional)
-tqdm  # Para barras de progreso
-
+scikit-learn>=0.24.0  # Para métricas, escalado y evaluación
+matplotlib>=3.3.0  # Para visualizaciones (opcional)
+tqdm>=4.62.0  # Para barras de progreso
+openpyxl>=3.0.0  # Para guardar métricas en Excel
