@@ -49,7 +49,7 @@ class Load_Dataset(Dataset):
         return self.len
 
 
-def data_generator(data_path, data_type, hparams):
+def data_generator(data_path, data_type, hparams, configs=None):
     """
     Genera dataloaders para train, validation y test.
     
@@ -57,10 +57,15 @@ def data_generator(data_path, data_type, hparams):
         data_path: Ruta base donde están los datos
         data_type: Tipo de dataset (mit, ptb, etc.)
         hparams: Hyperparámetros con batch_size
+        configs: Configuración del dataset (si no se provee, se importa)
         
     Returns:
         train_loader, val_loader, test_loader, class_weights_dict
     """
+    # Importar configs si no se provee
+    if configs is None:
+        from configs.data_configs import get_dataset_class
+        configs = get_dataset_class(data_type)()
     # Verificar que los archivos existan
     train_path = os.path.join(data_path, data_type, f"train.pt")
     val_path = os.path.join(data_path, data_type, f"val.pt")
@@ -89,11 +94,51 @@ def data_generator(data_path, data_type, hparams):
     val_dataset = Load_Dataset(val_dataset)
     test_dataset = Load_Dataset(test_dataset)
 
+    # Remapear etiquetas si hay más clases en los datos que las esperadas por el modelo
+    unique_classes = np.unique(train_dataset.y_data.numpy())
+    num_classes_in_data = len(unique_classes)
+    num_classes_expected = configs.num_classes
+    
+    if num_classes_in_data > num_classes_expected:
+        # Necesitamos remapear las clases a las esperadas
+        # Para PTB binario: mapear todas las clases anormales a 1
+        if num_classes_expected == 2:
+            # Mapear: clase 0 (normal) -> 0, todas las demás -> 1 (anormal)
+            print(f"Remapeando {num_classes_in_data} clases a 2 clases (binario):")
+            print(f"  Clases encontradas: {sorted(unique_classes)}")
+            print(f"  Mapeo: 0 -> 0 (normal), {sorted(set(unique_classes) - {0})} -> 1 (anormal)")
+            
+            # Remapear en todos los datasets
+            for dataset in [train_dataset, val_dataset, test_dataset]:
+                y_data = dataset.y_data.numpy()
+                # Crear máscara: 0 -> 0, todo lo demás -> 1
+                y_remapped = np.where(y_data == 0, 0, 1)
+                dataset.y_data = torch.from_numpy(y_remapped).long()
+            
+            # Recalcular unique_classes después del remapeo
+            unique_classes = np.unique(train_dataset.y_data.numpy())
+            print(f"  Después del remapeo: clases {sorted(unique_classes)}")
+        else:
+            # Para otros casos, tomar solo las primeras num_classes_expected clases
+            print(f"Advertencia: Remapeando {num_classes_in_data} clases a {num_classes_expected} clases")
+            print(f"  Usando solo las primeras {num_classes_expected} clases: {sorted(unique_classes[:num_classes_expected])}")
+            
+            for dataset in [train_dataset, val_dataset, test_dataset]:
+                y_data = dataset.y_data.numpy()
+                # Remapear: mantener las primeras num_classes_expected, el resto a la última clase
+                y_remapped = np.where(y_data < num_classes_expected, y_data, num_classes_expected - 1)
+                dataset.y_data = torch.from_numpy(y_remapped).long()
+            
+            unique_classes = np.unique(train_dataset.y_data.numpy())
+    
     # Calcular pesos de clases para manejo de desbalance
+    # cw_dict contiene el conteo de cada clase en los datos de entrenamiento (después del remapeo)
     cw = train_dataset.y_data.numpy().tolist()
     cw_dict = {}
-    for i in range(len(np.unique(train_dataset.y_data.numpy()))):
-        cw_dict[i] = cw.count(i)
+    for cls in unique_classes:
+        cw_dict[int(cls)] = cw.count(int(cls))
+    
+    print(f"Distribución de clases después del remapeo: {cw_dict}")
 
     # Crear dataloaders con configuración optimizada
     batch_size = hparams.get("batch_size", 512)

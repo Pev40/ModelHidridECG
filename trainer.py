@@ -88,8 +88,9 @@ class trainer(object):
         return dataset_class(), hparams_class()
 
     def load_data(self, data_type):
+        # Pasar dataset_configs para remapeo de clases si es necesario
         self.train_dl, self.val_dl, self.test_dl, self.cw_dict = \
-            data_generator(self.data_path, data_type, self.hparams)
+            data_generator(self.data_path, data_type, self.hparams, self.dataset_configs)
 
     def calc_results_per_run(self):
         acc, f1 = _calc_metrics(self.pred_labels, self.true_labels, self.dataset_configs.class_names)
@@ -186,15 +187,33 @@ class trainer(object):
         self.scaler = GradScaler() if self.use_mixed_precision else None
         
         # Calcular pesos de clases para manejo de desbalance
+        # IMPORTANTE: Los pesos deben coincidir con num_classes del modelo, no con las clases encontradas en los datos
+        num_classes = self.dataset_configs.num_classes
         class_weights = get_class_weight(self.cw_dict)
-        weights = [float(class_weights.get(i, 1.0)) for i in range(len(self.cw_dict))]  # Asegurar que sean float nativos
+        
+        # Crear pesos solo para las clases esperadas (0 a num_classes-1)
+        weights = []
+        for i in range(num_classes):
+            if i in class_weights:
+                weights.append(float(class_weights[i]))
+            else:
+                # Si la clase no existe en los datos, usar peso 1.0
+                weights.append(1.0)
+                self.logger.warning(f"Clase {i} no encontrada en datos de entrenamiento, usando peso 1.0")
+        
+        # Verificar que tenemos exactamente num_classes pesos
+        if len(weights) != num_classes:
+            self.logger.error(f"Error: Se esperaban {num_classes} pesos pero se obtuvieron {len(weights)}")
+            raise ValueError(f"Número de pesos ({len(weights)}) no coincide con num_classes ({num_classes})")
+        
         weights_array = np.array(weights, dtype=np.float32)
         weights_tensor = torch.tensor(weights_array, dtype=torch.float32).to(self.device)
         self.cross_entropy = torch.nn.CrossEntropyLoss(weight=weights_tensor)
         
         # Convertir a dict simple para logging
         weights_dict = {i: float(w) for i, w in enumerate(weights)}
-        self.logger.debug(f"Pesos de clases: {weights_dict}")
+        self.logger.debug(f"Pesos de clases (num_classes={num_classes}): {weights_dict}")
+        self.logger.debug(f"Clases encontradas en datos: {list(self.cw_dict.keys())}")
 
         best_acc = 0
         best_f1 = 0
