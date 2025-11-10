@@ -6,6 +6,7 @@ import datetime
 import os
 import collections
 import numpy as np
+from tqdm import tqdm
 
 import warnings
 import sklearn.exceptions
@@ -130,13 +131,16 @@ class trainer(object):
         # model = model.to(memory_format=torch.channels_last)  # Opcional, probar si mejora
         
         # Compilar modelo para optimización (PyTorch 2.0+)
+        # Nota: torch.compile puede aumentar uso de memoria, desactivar si hay OOM
         if self.use_compile and hasattr(torch, 'compile'):
             try:
                 self.logger.debug("Compilando modelo con torch.compile...")
-                model = torch.compile(model, mode='reduce-overhead')  # o 'max-autotune' para máxima optimización
+                # Usar mode='default' para menor overhead de memoria que 'reduce-overhead'
+                model = torch.compile(model, mode='default', fullgraph=False)
                 self.logger.debug("Modelo compilado exitosamente")
             except Exception as e:
-                self.logger.debug(f"No se pudo compilar el modelo: {e}")
+                self.logger.warning(f"No se pudo compilar el modelo, continuando sin compilación: {e}")
+                self.use_compile = False
         
         # Contar parámetros
         num_params = count_parameters(model)
@@ -199,8 +203,16 @@ class trainer(object):
         # Entrenamiento
         for epoch in range(1, self.hparams["num_epochs"] + 1):
             model.train()
+            
+            # Barra de progreso para entrenamiento
+            train_pbar = tqdm(
+                self.train_dl, 
+                desc=f'Epoch {epoch}/{self.hparams["num_epochs"]} [Train]',
+                ncols=120,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            )
 
-            for step, batches in enumerate(self.train_dl):
+            for step, batches in enumerate(train_pbar):
                 batches = to_device(batches, self.device)
 
                 data = batches['samples'].float()
@@ -248,14 +260,26 @@ class trainer(object):
                 # Actualizar métricas
                 loss_avg_meters['Total_loss'].update(total_loss.item(), data.size(0))
                 loss_avg_meters['Cls_loss'].update(cls_loss.item(), data.size(0))
+                
+                # Actualizar barra de progreso con información en tiempo real
+                postfix_dict = {
+                    'Loss': f'{loss_avg_meters["Total_loss"].avg:.4f}',
+                    'Cls': f'{loss_avg_meters["Cls_loss"].avg:.4f}'
+                }
+                if self.use_morph_loss and 'Morph_loss' in loss_avg_meters:
+                    postfix_dict['Morph'] = f'{loss_avg_meters["Morph_loss"].avg:.4f}'
+                train_pbar.set_postfix(postfix_dict)
 
-            # Logging de pérdidas
+            # Cerrar barra de progreso de entrenamiento
+            train_pbar.close()
+            
+            # Logging de pérdidas (mantener para logs de archivo)
             self.logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
             for key, val in loss_avg_meters.items():
                 self.logger.debug(f'{key}\t: {val.avg:2.4f}')
 
-            # Validación
-            self.evaluate(model, self.val_dl, use_morph_loss=False)  # No necesitamos morph_loss en validación
+            # Validación con barra de progreso
+            self.evaluate(model, self.val_dl, use_morph_loss=False, desc=f'Epoch {epoch}/{self.hparams["num_epochs"]} [Val]')
             val_acc, val_f1 = self.calc_results_per_run()
             
             # Guardar mejor modelo basado en F1-score
@@ -265,8 +289,15 @@ class trainer(object):
                 best_epoch = epoch
                 save_checkpoint(self.exp_log_dir, model, self.dataset, self.dataset_configs, self.hparams, "best")
                 _save_metrics(self.pred_labels, self.true_labels, self.scenario_log_dir, "validation_best")
+                print(f"*** NUEVO MEJOR MODELO *** (Epoch {epoch})")
                 self.logger.debug(f"*** NUEVO MEJOR MODELO *** (Epoch {epoch})")
 
+            # Mostrar resultados en consola con formato mejorado
+            print(f"\n{'='*80}")
+            print(f"Epoch {epoch}/{self.hparams['num_epochs']} - Results:")
+            print(f"  VAL  : Acc: {val_acc:7.4f} | F1: {val_f1:7.4f} (best: {best_f1:7.4f} @ epoch {best_epoch})")
+            print(f"{'='*80}\n")
+            
             # Logging
             self.logger.debug(f'VAL  : Acc:{val_acc:2.4f} \t F1:{val_f1:2.4f} (best: {best_f1:2.4f} @ epoch {best_epoch})')
             self.logger.debug(f'-------------------------------------')
@@ -296,12 +327,15 @@ class trainer(object):
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             model.load_state_dict(checkpoint['model'])
             model.to(self.device)
-            self.evaluate(model, self.test_dl, use_morph_loss=False)
+            self.evaluate(model, self.test_dl, use_morph_loss=False, desc='Testing [Best Model]')
             test_acc_best, test_f1_best = self.calc_results_per_run()
             _save_metrics(self.pred_labels, self.true_labels, self.scenario_log_dir, "test_best")
+            print(f"\n{'='*80}")
+            print(f"TEST (Best Model): Acc: {test_acc_best:7.4f} | F1: {test_f1_best:7.4f}")
+            print(f"{'='*80}\n")
             self.logger.debug(f'TEST (best model): Acc:{test_acc_best:2.4f} \t F1:{test_f1_best:2.4f}')
 
-    def evaluate(self, model, dataset, use_morph_loss=False):
+    def evaluate(self, model, dataset, use_morph_loss=False, desc=None):
         """Evalúa el modelo en un conjunto de datos."""
         model.to(self.device).eval()
 
@@ -309,9 +343,18 @@ class trainer(object):
         self.pred_labels = np.array([])
         self.true_labels = np.array([])
 
+        # Barra de progreso para evaluación
+        eval_pbar = tqdm(
+            dataset,
+            desc=desc if desc else 'Evaluating',
+            ncols=120,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+            leave=False
+        )
+
         model.eval()
         with torch.no_grad():
-            for batches in dataset:
+            for batches in eval_pbar:
                 batches = to_device(batches, self.device)
                 data = batches['samples'].float()
                 labels = batches['labels'].long()
@@ -331,6 +374,12 @@ class trainer(object):
 
                 self.pred_labels = np.append(self.pred_labels, pred.cpu().numpy())
                 self.true_labels = np.append(self.true_labels, labels.data.cpu().numpy())
+                
+                # Actualizar barra de progreso con pérdida promedio
+                if len(total_loss_) > 0:
+                    avg_loss = np.mean(total_loss_)
+                    eval_pbar.set_postfix({'Loss': f'{avg_loss:.4f}'})
 
+        eval_pbar.close()
         self.trg_loss = torch.tensor(total_loss_).mean()  # pérdida promedio
 

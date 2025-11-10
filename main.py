@@ -169,11 +169,16 @@ class TF_MorphoTransNet(nn.Module):
         )
 
         # Variable-Temporal Self-Attention (lightweight version)
-        # Actualizado: 8 heads como se menciona en el pipeline (pero reducido a 4 para eficiencia)
-        self.vt_sa = LightweightVTSA(dim=self.out_channels, heads=4, dim_head=32)  # Reduced params for efficiency
+        # Reducido a 2 heads para ahorrar memoria con batch_size grande
+        # La memoria de atención es O(batch_size * heads * seq_len^2)
+        self.vt_sa = LightweightVTSA(dim=self.out_channels, heads=2, dim_head=32)  # Reduced heads for memory efficiency
 
-        # Bidirectional Transformer Encoder (lightweight: 2 layers, 4 heads)
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.out_channels, nhead=4, dim_feedforward=128, dropout=0.1, batch_first=True)
+        # Bidirectional Transformer Encoder (lightweight: 2 layers, 2 heads para ahorrar memoria)
+        # Con batch_size=512, reducir heads de 4 a 2 reduce memoria de atención en 50%
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.out_channels, nhead=2, dim_feedforward=128, 
+            dropout=0.1, batch_first=True, activation='gelu'
+        )
         self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=2)  # Reduced layers
 
         # Channel Recalibration Module (CRM) - copied/adapted from original, lightweight reduction
