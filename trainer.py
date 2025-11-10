@@ -205,11 +205,21 @@ class trainer(object):
             model.train()
             
             # Barra de progreso para entrenamiento
+            # Configuración optimizada para una sola barra sin duplicados
             train_pbar = tqdm(
                 self.train_dl, 
                 desc=f'Epoch {epoch}/{self.hparams["num_epochs"]} [Train]',
-                ncols=120,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+                total=len(self.train_dl),
+                ncols=100,
+                miniters=max(1, len(self.train_dl) // 100),  # Actualizar máximo 100 veces por época
+                mininterval=0.5,  # Actualizar mínimo cada 0.5 segundos
+                maxinterval=10.0,
+                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                dynamic_ncols=False,
+                ascii=False,
+                disable=False,
+                file=None,
+                smoothing=0.3
             )
 
             for step, batches in enumerate(train_pbar):
@@ -261,14 +271,14 @@ class trainer(object):
                 loss_avg_meters['Total_loss'].update(total_loss.item(), data.size(0))
                 loss_avg_meters['Cls_loss'].update(cls_loss.item(), data.size(0))
                 
-                # Actualizar barra de progreso con información en tiempo real
-                postfix_dict = {
-                    'Loss': f'{loss_avg_meters["Total_loss"].avg:.4f}',
-                    'Cls': f'{loss_avg_meters["Cls_loss"].avg:.4f}'
-                }
-                if self.use_morph_loss and 'Morph_loss' in loss_avg_meters:
-                    postfix_dict['Morph'] = f'{loss_avg_meters["Morph_loss"].avg:.4f}'
-                train_pbar.set_postfix(postfix_dict)
+                # Actualizar barra de progreso con postfix solo cada N batches
+                # para reducir redibujados y evitar duplicación
+                update_freq = max(5, len(self.train_dl) // 20)  # Actualizar ~20 veces por época
+                if (step + 1) % update_freq == 0 or (step + 1) == len(self.train_dl):
+                    postfix_str = f"Loss:{loss_avg_meters['Total_loss'].avg:.4f} Cls:{loss_avg_meters['Cls_loss'].avg:.4f}"
+                    if self.use_morph_loss and 'Morph_loss' in loss_avg_meters:
+                        postfix_str += f" Morph:{loss_avg_meters['Morph_loss'].avg:.4f}"
+                    train_pbar.set_postfix_str(postfix_str)
 
             # Cerrar barra de progreso de entrenamiento
             train_pbar.close()
@@ -347,9 +357,16 @@ class trainer(object):
         eval_pbar = tqdm(
             dataset,
             desc=desc if desc else 'Evaluating',
-            ncols=120,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-            leave=False
+            total=len(dataset),
+            ncols=100,
+            miniters=max(1, len(dataset) // 50),  # Actualizar máximo 50 veces
+            mininterval=0.5,
+            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+            leave=False,
+            dynamic_ncols=False,
+            ascii=False,
+            disable=False,
+            smoothing=0.3
         )
 
         model.eval()
@@ -375,10 +392,11 @@ class trainer(object):
                 self.pred_labels = np.append(self.pred_labels, pred.cpu().numpy())
                 self.true_labels = np.append(self.true_labels, labels.data.cpu().numpy())
                 
-                # Actualizar barra de progreso con pérdida promedio
-                if len(total_loss_) > 0:
+                # Actualizar pérdida en barra solo ocasionalmente
+                update_freq = max(3, len(dataset) // 20)
+                if len(total_loss_) % update_freq == 0 or len(total_loss_) == len(dataset):
                     avg_loss = np.mean(total_loss_)
-                    eval_pbar.set_postfix({'Loss': f'{avg_loss:.4f}'})
+                    eval_pbar.set_postfix_str(f"Loss:{avg_loss:.4f}")
 
         eval_pbar.close()
         self.trg_loss = torch.tensor(total_loss_).mean()  # pérdida promedio
