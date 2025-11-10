@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 import datetime
@@ -64,10 +65,21 @@ class trainer(object):
             # (desactivar si necesitas reproducibilidad exacta)
             torch.backends.cudnn.deterministic = False
             # Habilitar TF32 para Ampere+ (RTX 30/40 series, A100, etc.) - acelera FP32
-            if hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
-                torch.backends.cuda.matmul.allow_tf32 = True
-            if hasattr(torch.backends.cudnn, 'allow_tf32'):
-                torch.backends.cudnn.allow_tf32 = True
+            # Usar nueva API (PyTorch 2.0+)
+            try:
+                # Nueva API para TF32
+                if hasattr(torch.backends.cuda.matmul, 'fp32_precision'):
+                    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+                elif hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                
+                if hasattr(torch.backends.cudnn, 'conv') and hasattr(torch.backends.cudnn.conv, 'fp32_precision'):
+                    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+                elif hasattr(torch.backends.cudnn, 'allow_tf32'):
+                    torch.backends.cudnn.allow_tf32 = True
+            except (AttributeError, TypeError):
+                # API antigua no disponible, continuar sin TF32
+                pass
 
     def get_configs(self):
         dataset_class = get_dataset_class(self.dataset)
@@ -144,26 +156,27 @@ class trainer(object):
         loss_avg_meters = collections.defaultdict(lambda: AverageMeter())
 
         # Optimizador (AdamW puede ser más estable que Adam)
-        # Fused solo disponible en PyTorch 1.13+ y requiere CUDA
+        # Intentar usar fused si está disponible (PyTorch 1.13+)
         optimizer_kwargs = {
             'lr': self.hparams["learning_rate"],
             'weight_decay': self.hparams["weight_decay"],
             'betas': (0.9, 0.999),
             'eps': 1e-8
         }
-        # Agregar fused si está disponible (PyTorch 1.13+)
+        
+        # Intentar crear optimizador con fused primero, si falla usar sin fused
         if torch.cuda.is_available():
             try:
-                # Probar si fused está disponible
-                test_optim = torch.optim.AdamW([torch.randn(1, requires_grad=True).cuda()], fused=True)
-                optimizer_kwargs['fused'] = True
-                del test_optim
-                torch.cuda.empty_cache()
-            except (TypeError, AttributeError):
-                # fused no está disponible, usar optimizador normal
-                pass
-        
-        self.optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+                # Intentar crear con fused=True
+                self.optimizer = torch.optim.AdamW(model.parameters(), fused=True, **optimizer_kwargs)
+                self.logger.debug("Optimizador AdamW con fused=True habilitado")
+            except (TypeError, AttributeError, ValueError, RuntimeError) as e:
+                # fused no está disponible o no funciona, usar optimizador estándar
+                self.optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+                self.logger.debug(f"Optimizador fused no disponible, usando optimizador estándar: {type(e).__name__}")
+        else:
+            # CPU: no usar fused
+            self.optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
         
         # Mixed precision scaler
         self.scaler = GradScaler() if self.use_mixed_precision else None
